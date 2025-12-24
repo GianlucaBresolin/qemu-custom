@@ -1444,6 +1444,7 @@ static void lm3s6965evb_class_init(ObjectClass *oc, const void *data)
     mc->ignore_memory_transaction_failures = true;
     mc->default_cpu_type = ARM_CPU_TYPE_NAME("cortex-m3");
     mc->auto_create_sdcard = true;
+    machine_class_allow_dynamic_sysbus_dev(mc, "virtual-can-controller");
 }
 
 static const TypeInfo lm3s6965evb_type = {
