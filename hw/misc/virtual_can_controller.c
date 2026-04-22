@@ -3,16 +3,58 @@
 #include "qemu/error-report.h"
 #include "qemu/bswap.h"
 #include "qapi/error.h"
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
 
 #define TYPE_VIRTUAL_CAN_CONTROLLER "virtual-can-controller"
 OBJECT_DECLARE_SIMPLE_TYPE(VirtualCANControllerState, VIRTUAL_CAN_CONTROLLER)
+
+typedef enum {
+    ERROR_ACTIVE, 
+    ERROR_PASSIVE,
+    BUS_OFF
+} CANBusState;
 
 typedef struct VirtualCANControllerState {
     SysBusDevice parent_obj;
     MemoryRegion mmio;
     uint64_t base_addr;
     QemuMutex lock;
+
+    int socket_fd;
+    char server_address[256];
+    uint16_t server_port;
+
+    // CAN BUS STATE
+    CANBusState can_bus_state;
+    uint16_t tx_error_count;
+    uint8_t rx_error_count;
 } VirtualCANControllerState;
+
+static uint8_t connect_to_virtual_can_bus(VirtualCANControllerState *state) {
+    
+    struct sockaddr_in serv_addr;
+
+    state->socket_fd = socket(AF_INET, SOCK_STREAM, 0),
+    if (state->socket_fd < 0) {
+        return -1;
+    }
+
+    serv_addr.sin_family = AF_INET;
+    serv_addr.sin_port = htons(state->server_port);
+    if (inet_pton(AF_INET, state->server_ip, &serv_addr.sin_addr) <= 0) {
+        return -1;
+    }
+
+    if (connect(state->sock_fd, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) < 0) {
+        close(state->sock_fd);
+        state->sock_fd = -1;
+        return -1;
+    }
+
+    return 0;
+}
 
 static uint64_t virtual_can_controller_read(void *opaque, hwaddr offset, unsigned size)
 {
@@ -104,6 +146,14 @@ static void virtual_can_controller_write(void *opaque, hwaddr offset, uint64_t v
         error_report("virtual-can-controller: failed to send write request");
     }
 
+    // Send data to virutal CAN bus
+    ssize_t sent = send(state->sock_fd, req, packet_size, 0);
+    if (sent != packet_size) {
+        error_report("virtual-can-controller: failed to send TCP data");
+        close(state->sock_fd);
+        state->sock_fd = -1;
+    }
+
     unlock:
     qemu_mutex_unlock(&state->lock);
 }
@@ -143,6 +193,14 @@ static void virtual_can_controller_realize(DeviceState *dev, Error **errp)
     );
 
     sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, state->base_addr);
+
+    // Init CAN bus state
+    state->can_bus_state = ERROR_ACTIVE;
+    state->tx_error_count = 0;
+    state->rx_error_count = 0;
+
+    // Connect to our virtual CAN bus
+    connect_to_virtual_can_bus(state);
 }
 
 static void virtual_can_controller_instance_init(Object *obj)
@@ -179,3 +237,49 @@ static void virtual_can_controller_register_types(void)
 }
 
 type_init(virtual_can_controller_register_types);
+
+///////////////////////////
+// CAN BUS UTILITIES
+///////////////////////////
+static void apply_tx_errror(VirtualCANControllerState *state) {
+    state->tx_error_count += 8;
+    update_can_bus_state(state);
+}
+
+static void apply_rx_error(VirtualCANControllerState *state) 
+{
+    if (state->rx_error_count < UINT8_MAX) {
+        state->rx_error_count++;
+    }
+    update_can_bus_state(state);
+}
+
+static void apply_successfull_tx(VirtualCANControllerState *state) 
+{
+    if state->can_bus_state == BUS_OFF {
+        // once in BUS_OFF, do not allow state changes
+        return;
+    }
+    if (state->tx_error_count > 0) {
+        state->tx_error_count--;
+    }
+    if (state->rx_error_count > 0) {
+        state->rx_error_count--;
+    }
+    update_can_bus_state(state);
+}
+
+static void update_can_bus_state(VirtualCANControllerState *state) 
+{
+    if (state->can_bus_state == BUS_OFF) {    
+        // once in BUS_OFF, do not allow state changes
+        return;
+    }
+    if (state->tx_error_count > 255) {
+        state->can_bus_state = BUS_OFF;
+    } else if (state->tx_error_count > 127 || state->rx_error_count > 127) {
+        state->can_bus_state = ERROR_PASSIVE;
+    } else {
+        state->can_bus_state = ERROR_ACTIVE;
+    }
+}
