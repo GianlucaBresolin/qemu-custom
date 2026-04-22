@@ -22,6 +22,7 @@ typedef struct VirtualCANControllerState {
     uint64_t base_addr;
     QemuMutex lock;
 
+    // TCP CONNECTION
     int socket_fd;
     char server_address[256];
     uint16_t server_port;
@@ -241,32 +242,57 @@ type_init(virtual_can_controller_register_types);
 ///////////////////////////
 // CAN BUS UTILITIES
 ///////////////////////////
-static void apply_tx_errror(VirtualCANControllerState *state) {
+static void apply_tx_error(VirtualCANControllerState *state) {
+    qemu_mutex_lock(&state->lock);
+
+    if (state->can_bus_state == BUS_OFF) {
+        // once in BUS_OFF, do not allow state changes
+        goto unlock;
+    }
     state->tx_error_count += 8;
     update_can_bus_state(state);
+
+    unlock:
+    qemu_mutex_unlock(&state->lock);
 }
 
 static void apply_rx_error(VirtualCANControllerState *state) 
 {
+    qemu_mutex_lock(&state->lock);
+
+    if (state->can_bus_state == BUS_OFF) {
+        // once in BUS_OFF, do not allow state changes
+        goto unlock;
+    } 
     if (state->rx_error_count < UINT8_MAX) {
         state->rx_error_count++;
+        update_can_bus_state(state);
     }
-    update_can_bus_state(state);
+
+    unlock:
+    qemu_mutex_unlock(&state->lock);
 }
 
 static void apply_successfull_tx(VirtualCANControllerState *state) 
 {
-    if state->can_bus_state == BUS_OFF {
+    qemu_mutex_lock(&state->lock);
+
+    if (state->can_bus_state == BUS_OFF) {
         // once in BUS_OFF, do not allow state changes
-        return;
+        goto unlock;
     }
+
     if (state->tx_error_count > 0) {
         state->tx_error_count--;
     }
     if (state->rx_error_count > 0) {
         state->rx_error_count--;
     }
+    
     update_can_bus_state(state);
+
+    unlock:
+    qemu_mutex_unlock(&state->lock);
 }
 
 static void update_can_bus_state(VirtualCANControllerState *state) 
