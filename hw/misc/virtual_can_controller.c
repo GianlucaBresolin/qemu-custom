@@ -16,41 +16,53 @@ typedef enum {
     BUS_OFF
 } CANBusState;
 
+typedef struct {
+    uint32_t id;
+    bool id_ready;
+    uint8_t dlc;
+    bool dlc_ready;
+    uint8_t data[8];
+    bool data_low_ready;
+    bool data_high_ready;
+} RoughCANFrame;
+
 typedef struct VirtualCANControllerState {
     SysBusDevice parent_obj;
     MemoryRegion mmio;
     uint64_t base_addr;
     QemuMutex lock;
 
-    // TCP CONNECTION
-    int socket_fd;
-    char server_address[256];
-    uint16_t server_port;
-
     // CAN BUS STATE
     CANBusState can_bus_state;
     uint16_t tx_error_count;
     uint8_t rx_error_count;
+    RoughCANFrame pending_rough_can_frame;
+
+    // TCP CONNECTION
+    int socket_fd;
+    char server_address[256];
+    uint16_t server_port;
 } VirtualCANControllerState;
 
-static uint8_t connect_to_virtual_can_bus(VirtualCANControllerState *state) {
+static uint8_t connect_to_virtual_can_bus(VirtualCANControllerState *state) 
+{
     
     struct sockaddr_in serv_addr;
 
-    state->socket_fd = socket(AF_INET, SOCK_STREAM, 0),
+    state->socket_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (state->socket_fd < 0) {
         return -1;
     }
 
     serv_addr.sin_family = AF_INET;
     serv_addr.sin_port = htons(state->server_port);
-    if (inet_pton(AF_INET, state->server_ip, &serv_addr.sin_addr) <= 0) {
+    if (inet_pton(AF_INET, state->server_adress, &serv_addr.sin_addr) <= 0) {
         return -1;
     }
 
-    if (connect(state->sock_fd, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) < 0) {
-        close(state->sock_fd);
-        state->sock_fd = -1;
+    if (connect(state->socket_fd, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) < 0) {
+        close(state->socket_fd);
+        state->socket_fd = -1;
         return -1;
     }
 
@@ -59,7 +71,6 @@ static uint8_t connect_to_virtual_can_bus(VirtualCANControllerState *state) {
 
 static uint64_t virtual_can_controller_read(void *opaque, hwaddr offset, unsigned size)
 {
-    printf("virtual_can_controller_read: offset=0x%08x, size=%u\n", (uint32_t)offset, size);
     VirtualCANControllerState *state = VIRTUAL_CAN_CONTROLLER(opaque);
 
     uint8_t req[6] = { 'R' }; // 'R' + addr(4B) + size(1B)
@@ -112,50 +123,41 @@ static void virtual_can_controller_write(void *opaque, hwaddr offset, uint64_t v
 {
     VirtualCANControllerState *state = VIRTUAL_CAN_CONTROLLER(opaque);
 
-    uint8_t req[14];
-    int packet_size = 6 + size;
-    int ret;
-    
     qemu_mutex_lock(&state->lock);
 
-    // Build request packet: 'W' + addr(4B) + size(1B) + data(8B max)
-    req[0] = 'W';
-    stl_le_p(req + 1, (uint32_t)offset);
-    req[5] = (uint8_t)size;
-
-    // Add data in little-endian format
-    switch (size) {
-    case 1:
-        req[6] = (uint8_t)value;
-        break;
-    case 2:
-        stw_le_p(req + 6, (uint16_t)value);
-        break;
-    case 4: 
-        stl_le_p(req + 6, (uint32_t)value);
-        break;
-    default:
-        error_report("virtual-can-controller: invalid write size %u", size);
-        goto unlock;
+    switch(offset) {
+        case 0x00: // ID
+            state->pending_rough_can_frame.id = (uint32_t)value;
+            state->pending_rough_can_frame.id_ready = true;
+            break;
+        case 0x04: // DLC
+            state->pending_rough_can_frame.dlc = (uint8_t)value;
+            state->pending_rough_can_frame.dlc_ready = true;
+            break;
+        case 0x08: // Data-low
+            state->pending_rough_can_frame.data[0] = (uint8_t)(value & 0xFF); 
+            state->pending_rough_can_frame.data[1] = (uint8_t)((value >> 8) & 0xFF);
+            state->pending_rough_can_frame.data[2] = (uint8_t)((value >> 16) & 0xFF);
+            state->pending_rough_can_frame.data[3] = (uint8_t)((value >> 24) & 0xFF);
+            state->pending_rough_can_frame.data_low_ready = true;
+            break;
+        case 0x0C: // Data-high
+            state->pending_rough_can_frame.data[4] = (uint8_t)(value & 0xFF);
+            state->pending_rough_can_frame.data[5] = (uint8_t)((value >> 8) & 0xFF);
+            state->pending_rough_can_frame.data[6] = (uint8_t)((value >> 16) & 0xFF);
+            state->pending_rough_can_frame.data[7] = (uint8_t)((value >> 24) & 0xFF);
+            state->pending_rough_can_frame.data_high_ready = true;
+            break;
+        case 0x10: // Command
+            switch(value) {
+                case 0: // Abort frame
+                    clear_rough_can_frame(state);
+                    break;
+                case 1: // Send frame
+                    send_rough_can_frame(state);
+            }
     }
 
-    // Send request
-    printf("Sending write request: addr=0x%08x, size=%u, value=0x%llx\n",
-           (uint32_t)offset, size, (unsigned long long)value);
-    ret = packet_size;
-    if (ret != packet_size) {
-        error_report("virtual-can-controller: failed to send write request");
-    }
-
-    // Send data to virutal CAN bus
-    ssize_t sent = send(state->sock_fd, req, packet_size, 0);
-    if (sent != packet_size) {
-        error_report("virtual-can-controller: failed to send TCP data");
-        close(state->sock_fd);
-        state->sock_fd = -1;
-    }
-
-    unlock:
     qemu_mutex_unlock(&state->lock);
 }
 
@@ -172,13 +174,6 @@ static const MemoryRegionOps virtual_can_controller_ops = {
 static void virtual_can_controller_realize(DeviceState *dev, Error **errp)
 {
     VirtualCANControllerState *state = VIRTUAL_CAN_CONTROLLER(dev);
-
-    /*
-    if (!verify_backend_connected()) {
-        error_setg(errp, "mmio-sockdev: backennd not connected");
-        return;
-    }
-    */
 
     state->base_addr = 0x40006400; // Default CAN1 base address
 
@@ -239,47 +234,68 @@ static void virtual_can_controller_register_types(void)
 
 type_init(virtual_can_controller_register_types);
 
-///////////////////////////
+///////////////////////////////////////////////////////////////////////////////
 // CAN BUS UTILITIES
-///////////////////////////
-static void apply_tx_error(VirtualCANControllerState *state) {
-    qemu_mutex_lock(&state->lock);
+// Note: these functions are called with the state lock held, so we can safely
+// access and modify the CAN bus state and the pending rough CAN frame without
+// additional synchronization mechanism required. 
+///////////////////////////////////////////////////////////////////////////////
 
+static void clear_rough_can_frame(VirtualCANControllerState *state) {
+    state->pending_rough_can_frame.id_ready = false;
+    state->pending_rough_can_frame.dlc_ready = false;
+    state->pending_rough_can_frame.data_low_ready = false;
+    state->pending_rough_can_frame.data_high_ready = false;
+}
+
+static void send_rough_can_frame(VirtualCANControllerState *state) {
+    if (state->pending_rough_can_frame.id_ready &&
+        state->pending_rough_can_frame.dlc_ready &&
+        state->pending_rough_can_frame.data_low_ready &&
+        state->pending_rough_can_frame.data_high_ready) {
+            build_can_frame(state);
+            serialize_can_frame(state);
+            clear_rough_can_frame(state);
+        } else {
+            // abort frame transmission: clear rough can frame
+            clear_rough_can_frame(state);
+        }
+}
+
+static void build_can_frame(VirtualCANControllerState *state) {
+    // TODO
+}
+
+static void serialize_can_frame(VirtualCANControllerState *state) {
+    // TODO
+}
+
+static void apply_tx_error(VirtualCANControllerState *state) {
     if (state->can_bus_state == BUS_OFF) {
         // once in BUS_OFF, do not allow state changes
-        goto unlock;
+        return;
     }
     state->tx_error_count += 8;
     update_can_bus_state(state);
-
-    unlock:
-    qemu_mutex_unlock(&state->lock);
 }
 
 static void apply_rx_error(VirtualCANControllerState *state) 
 {
-    qemu_mutex_lock(&state->lock);
-
     if (state->can_bus_state == BUS_OFF) {
         // once in BUS_OFF, do not allow state changes
-        goto unlock;
+        return;
     } 
     if (state->rx_error_count < UINT8_MAX) {
         state->rx_error_count++;
         update_can_bus_state(state);
     }
-
-    unlock:
-    qemu_mutex_unlock(&state->lock);
 }
 
 static void apply_successfull_tx(VirtualCANControllerState *state) 
 {
-    qemu_mutex_lock(&state->lock);
-
     if (state->can_bus_state == BUS_OFF) {
         // once in BUS_OFF, do not allow state changes
-        goto unlock;
+        return;
     }
 
     if (state->tx_error_count > 0) {
@@ -288,11 +304,8 @@ static void apply_successfull_tx(VirtualCANControllerState *state)
     if (state->rx_error_count > 0) {
         state->rx_error_count--;
     }
-    
-    update_can_bus_state(state);
 
-    unlock:
-    qemu_mutex_unlock(&state->lock);
+    update_can_bus_state(state);
 }
 
 static void update_can_bus_state(VirtualCANControllerState *state) 
