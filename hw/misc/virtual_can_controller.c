@@ -19,12 +19,19 @@ typedef enum {
 typedef struct {
     uint32_t id;
     bool id_ready;
+    uint8_t rtr;
+    bool rtr_ready;
     uint8_t dlc;
     bool dlc_ready;
     uint8_t data[8];
     bool data_low_ready;
     bool data_high_ready;
 } RoughCANFrame;
+
+typedef struct {
+    uint8_t bits[];
+    int count;
+} CANFrame;
 
 typedef struct VirtualCANControllerState {
     SysBusDevice parent_obj;
@@ -127,28 +134,41 @@ static void virtual_can_controller_write(void *opaque, hwaddr offset, uint64_t v
 
     switch(offset) {
         case 0x00: // ID
+            if (value > 0x7FF) {
+                error_report("virtual-can-controller: invalid 11-bit CAN ID");
+                state->pending_rough_can_frame.id_ready = false;
+                break;
+            }
             state->pending_rough_can_frame.id = (uint32_t)value;
             state->pending_rough_can_frame.id_ready = true;
             break;
-        case 0x04: // DLC
+        case 0x04: // RTR
+            if (value != 0) {   
+                state->pending_rough_can_frame.rtr = 1;
+            } else {
+                state->pending_rough_can_frame.rtr = 0;
+            }
+            state->pending_rough_can_frame.rtr_ready = true;
+            break;
+        case 0x08: // DLC
             state->pending_rough_can_frame.dlc = (uint8_t)value;
             state->pending_rough_can_frame.dlc_ready = true;
             break;
-        case 0x08: // Data-low
+        case 0x0c: // Data-low
             state->pending_rough_can_frame.data[0] = (uint8_t)(value & 0xFF); 
             state->pending_rough_can_frame.data[1] = (uint8_t)((value >> 8) & 0xFF);
             state->pending_rough_can_frame.data[2] = (uint8_t)((value >> 16) & 0xFF);
             state->pending_rough_can_frame.data[3] = (uint8_t)((value >> 24) & 0xFF);
             state->pending_rough_can_frame.data_low_ready = true;
             break;
-        case 0x0C: // Data-high
+        case 0x10: // Data-high
             state->pending_rough_can_frame.data[4] = (uint8_t)(value & 0xFF);
             state->pending_rough_can_frame.data[5] = (uint8_t)((value >> 8) & 0xFF);
             state->pending_rough_can_frame.data[6] = (uint8_t)((value >> 16) & 0xFF);
             state->pending_rough_can_frame.data[7] = (uint8_t)((value >> 24) & 0xFF);
             state->pending_rough_can_frame.data_high_ready = true;
             break;
-        case 0x10: // Command
+        case 0x14: // Command
             switch(value) {
                 case 0: // Abort frame
                     clear_rough_can_frame(state);
@@ -243,6 +263,7 @@ type_init(virtual_can_controller_register_types);
 
 static void clear_rough_can_frame(VirtualCANControllerState *state) {
     state->pending_rough_can_frame.id_ready = false;
+    state->pending_rough_can_frame.rtr_ready = false;
     state->pending_rough_can_frame.dlc_ready = false;
     state->pending_rough_can_frame.data_low_ready = false;
     state->pending_rough_can_frame.data_high_ready = false;
@@ -250,6 +271,7 @@ static void clear_rough_can_frame(VirtualCANControllerState *state) {
 
 static void send_rough_can_frame(VirtualCANControllerState *state) {
     if (state->pending_rough_can_frame.id_ready &&
+        state->pending_rough_can_frame.rtr_ready &&
         state->pending_rough_can_frame.dlc_ready &&
         state->pending_rough_can_frame.data_low_ready &&
         state->pending_rough_can_frame.data_high_ready) {
@@ -263,6 +285,47 @@ static void send_rough_can_frame(VirtualCANControllerState *state) {
 }
 
 static void build_can_frame(VirtualCANControllerState *state) {
+    CANFrame frame;
+
+    // SoF
+    frame.bits[0] = 0; 
+    // ID
+    for (int i = 0; i < 11; i++) {
+        frame.bits[1 +i] = (state->pending_rough_can_frame.id >> (10 - i)) & 1;
+    }
+    // RTR
+    frame.bits[12] = state->pending_rough_can_frame.rtr;
+    // Control 
+    frame.bits[13] = 0; // IDE (ignored)
+    frame.bits[14] = 0; // r0 (ignored)
+    for (int i = 0; i < 4; i++) {
+        frame.bits[15 +i] = (state->pending_rough_can_frame.dlc >> (3 - i)) & 1;
+    }
+    // Data
+    for (int i = 0; i < 8; i++) {
+        for (int j = 0; j < 8; j++) {
+            frame.bits[19 + i*8 + j] = (state->pending_rough_can_frame.data[i] >> (7 - j)) & 1;
+        }
+    }
+    // CRC (ignored)
+    for (int i = 0; i < 15; i++) {
+        frame.bits[83 + i] = 0;
+    }
+    // ACK (ignored)
+    frame.bits[98] = 0; // ACK slot
+    frame.bits[99] = 1; // ACK delimiter
+    // EoF
+    for (int i = 0; i < 7; i++) {
+        frame.bits[100 +i] = 0;
+    }
+    // IFS
+    for (int i = 0; i < 3; i++) {
+        frame.bits[107 +i] = 0;
+    }
+    apply_bit_stuffing(&frame);
+}
+
+static void apply_bit_stuffing(CANFrame *frame) {
     // TODO
 }
 
