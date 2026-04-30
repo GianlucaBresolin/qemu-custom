@@ -10,6 +10,7 @@
 #define TYPE_VIRTUAL_CAN_CONTROLLER "virtual-can-controller"
 OBJECT_DECLARE_SIMPLE_TYPE(VirtualCANControllerState, VIRTUAL_CAN_CONTROLLER)
 
+#define MAX_CAN_BITS 135 
 typedef enum {
     ERROR_ACTIVE, 
     ERROR_PASSIVE,
@@ -30,7 +31,7 @@ typedef struct {
 
 typedef struct {
     uint8_t bits[];
-    int count;
+    uint16_t lenght;
 } CANFrame;
 
 typedef struct VirtualCANControllerState {
@@ -44,6 +45,8 @@ typedef struct VirtualCANControllerState {
     uint16_t tx_error_count;
     uint8_t rx_error_count;
     RoughCANFrame pending_rough_can_frame;
+    CANFrame tx_queue[];
+    uint8_t tx_queue_length;
 
     // TCP CONNECTION
     int socket_fd;
@@ -214,6 +217,7 @@ static void virtual_can_controller_realize(DeviceState *dev, Error **errp)
     state->can_bus_state = ERROR_ACTIVE;
     state->tx_error_count = 0;
     state->rx_error_count = 0;
+    state->tx_queue_length = 0;
 
     // Connect to our virtual CAN bus
     connect_to_virtual_can_bus(state);
@@ -276,12 +280,10 @@ static void send_rough_can_frame(VirtualCANControllerState *state) {
         state->pending_rough_can_frame.data_low_ready &&
         state->pending_rough_can_frame.data_high_ready) {
             build_can_frame(state);
-            serialize_can_frame(state);
-            clear_rough_can_frame(state);
-        } else {
-            // abort frame transmission: clear rough can frame
-            clear_rough_can_frame(state);
         }
+    // clear pending rough CAN frame regardless of whether it was valid or not,
+    // to avoid sending stale data in the next transmissions
+    clear_rough_can_frame(state);
 }
 
 static void build_can_frame(VirtualCANControllerState *state) {
@@ -314,23 +316,58 @@ static void build_can_frame(VirtualCANControllerState *state) {
     // ACK (ignored)
     frame.bits[98] = 0; // ACK slot
     frame.bits[99] = 1; // ACK delimiter
+
+    // Apply bit stuffing (frame length may change)
+    apply_bit_stuffing(&frame);
+
     // EoF
     for (int i = 0; i < 7; i++) {
-        frame.bits[100 +i] = 0;
+        frame.bits[frame.lenght +i] = 1;
     }
-    // IFS
+    frame.lenght += 7;
+    // IFS 
+    // TODO: inssert it when we transmit the frame, not here
     for (int i = 0; i < 3; i++) {
-        frame.bits[107 +i] = 0;
+        frame.bits[frame.lenght + i] = 1;
     }
-    apply_bit_stuffing(&frame);
+    frame.lenght += 3;
+    append_can_frame_to_tx_queue(state, &frame);
 }
 
 static void apply_bit_stuffing(CANFrame *frame) {
-    // TODO
+    uint8_t stuffed_bits[MAX_CAN_BITS]
+    stuffed_bits[0] = frame->bits[0];
+    int8_t consecutive_count = 1;
+    int16_t current_stuffed_bits = 1;
+
+    for (int i = 1; i < frame->len; i++) {
+        uint8_t current_bit = frame->bits[i];
+        stuffed_bits[current_stuffed_bits] = current_bit;
+        current_stuffed_bits++;
+
+        if (current_bit == stuffed_bits[current_stuffed_bits - 2]) {
+            // stuffed_bits[current_stuffed_bits -1] = current_bit;
+            // stuffed_bits[current_stuffed_bits -2] = previous_bit;
+            consecutive_count++;
+        } else {
+            consecutive_count = 1;
+        }
+
+        if (consecutive_count == 5) {
+            // insert opposite bit
+            stuffed_bits[current_stuffed_bits] = !current_bit;
+            current_stuffed_bits++;
+            consecutive_count = 1;
+        }
+    }
+    // replace with stuffed bits
+    memcpy(frame->bits, stuffed_bits, current_stuffed_bits);
+    frame->len = current_stuffed_bits;
 }
 
-static void serialize_can_frame(VirtualCANControllerState *state) {
-    // TODO
+static void append_can_frame_to_tx_queue(VirtualCANControllerState *state, CANFrame *frame) {
+    memcpy(state->tx_queue, frame->bits, frame->lenght);
+    state->tx_queue_length++;
 }
 
 static void apply_tx_error(VirtualCANControllerState *state) {
