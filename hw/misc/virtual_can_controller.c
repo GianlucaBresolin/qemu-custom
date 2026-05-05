@@ -1,4 +1,5 @@
 #include "qemu/osdep.h"
+#include "qemu/timer.h"
 #include "hw/sysbus.h"
 #include "qemu/error-report.h"
 #include "qemu/bswap.h"
@@ -30,8 +31,8 @@ typedef struct {
 } RoughCANFrame;
 
 typedef struct {
-    uint8_t bits[];
-    uint16_t lenght;
+    uint8_t bits[MAX_CAN_BITS];
+    uint16_t length;
 } CANFrame;
 
 typedef struct VirtualCANControllerState {
@@ -39,45 +40,25 @@ typedef struct VirtualCANControllerState {
     MemoryRegion mmio;
     uint64_t base_addr;
     QemuMutex lock;
+    QEMUTimer *tx_timer;
 
     // CAN BUS STATE
     CANBusState can_bus_state;
     uint16_t tx_error_count;
     uint8_t rx_error_count;
     RoughCANFrame pending_rough_can_frame;
-    CANFrame tx_queue[];
+
+    CANFrame tx_queue[10];
     uint8_t tx_queue_length;
+    bool tx_in_progress;
+    uint8_t tx_bit_cursor;
+    uint8_t transmitted_bit;
 
     // TCP CONNECTION
     int socket_fd;
     char server_address[256];
     uint16_t server_port;
 } VirtualCANControllerState;
-
-static uint8_t connect_to_virtual_can_bus(VirtualCANControllerState *state) 
-{
-    
-    struct sockaddr_in serv_addr;
-
-    state->socket_fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (state->socket_fd < 0) {
-        return -1;
-    }
-
-    serv_addr.sin_family = AF_INET;
-    serv_addr.sin_port = htons(state->server_port);
-    if (inet_pton(AF_INET, state->server_adress, &serv_addr.sin_addr) <= 0) {
-        return -1;
-    }
-
-    if (connect(state->socket_fd, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) < 0) {
-        close(state->socket_fd);
-        state->socket_fd = -1;
-        return -1;
-    }
-
-    return 0;
-}
 
 static uint64_t virtual_can_controller_read(void *opaque, hwaddr offset, unsigned size)
 {
@@ -208,7 +189,7 @@ static void virtual_can_controller_realize(DeviceState *dev, Error **errp)
         &virtual_can_controller_ops,
         state,
         TYPE_VIRTUAL_CAN_CONTROLLER,
-        0x1000 // MMIO region size
+        0x1000 // MMIO region size (TODO: resize it as needed).
     );
 
     sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, state->base_addr);
@@ -221,6 +202,10 @@ static void virtual_can_controller_realize(DeviceState *dev, Error **errp)
 
     // Connect to our virtual CAN bus
     connect_to_virtual_can_bus(state);
+
+    // Init TX Timer
+    state->tx_timer = timer_new_ms(QEMU_CLOCK_VIRTUAL, (QEMUTimerCB *)tx_timer_callback, state);
+    timer_mod(state->tx_timer, qemu_clock_get_ms(QEMU_CLOCK_VITUAL) + 1);
 }
 
 static void virtual_can_controller_instance_init(Object *obj)
@@ -322,25 +307,25 @@ static void build_can_frame(VirtualCANControllerState *state) {
 
     // EoF
     for (int i = 0; i < 7; i++) {
-        frame.bits[frame.lenght +i] = 1;
+        frame.bits[frame.length +i] = 1;
     }
-    frame.lenght += 7;
+    frame.length += 7;
     // IFS 
     // TODO: inssert it when we transmit the frame, not here
     for (int i = 0; i < 3; i++) {
-        frame.bits[frame.lenght + i] = 1;
+        frame.bits[frame.length + i] = 1;
     }
-    frame.lenght += 3;
+    frame.length += 3;
     append_can_frame_to_tx_queue(state, &frame);
 }
 
 static void apply_bit_stuffing(CANFrame *frame) {
-    uint8_t stuffed_bits[MAX_CAN_BITS]
+    uint8_t stuffed_bits[MAX_CAN_BITS];
     stuffed_bits[0] = frame->bits[0];
     int8_t consecutive_count = 1;
     int16_t current_stuffed_bits = 1;
 
-    for (int i = 1; i < frame->len; i++) {
+    for (int i = 1; i < frame->length; i++) {
         uint8_t current_bit = frame->bits[i];
         stuffed_bits[current_stuffed_bits] = current_bit;
         current_stuffed_bits++;
@@ -362,15 +347,22 @@ static void apply_bit_stuffing(CANFrame *frame) {
     }
     // replace with stuffed bits
     memcpy(frame->bits, stuffed_bits, current_stuffed_bits);
-    frame->len = current_stuffed_bits;
+    frame->length = current_stuffed_bits;
 }
 
-static void append_can_frame_to_tx_queue(VirtualCANControllerState *state, CANFrame *frame) {
-    memcpy(state->tx_queue, frame->bits, frame->lenght);
+static void append_can_frame_to_tx_queue(VirtualCANControllerState *state, CANFrame *frame) 
+{
+    if (state->tx_queue_length >= 10) {
+        error_report("virtual-can-controller: TX queue overflow, dropping CAN frame.");
+        return;
+    }
+    state->tx_queue[state->tx_queue_length] = *frame;
+    memcpy(state->tx_queue, frame->bits, frame->length);
     state->tx_queue_length++;
 }
 
-static void apply_tx_error(VirtualCANControllerState *state) {
+static void apply_tx_error(VirtualCANControllerState *state) 
+{
     if (state->can_bus_state == BUS_OFF) {
         // once in BUS_OFF, do not allow state changes
         return;
@@ -421,4 +413,76 @@ static void update_can_bus_state(VirtualCANControllerState *state)
     } else {
         state->can_bus_state = ERROR_ACTIVE;
     }
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// CAN BUS INTERACTION
+///////////////////////////////////////////////////////////////////////////////
+static uint8_t connect_to_virtual_can_bus(VirtualCANControllerState *state) 
+{   
+    struct sockaddr_in serv_addr;
+
+    state->socket_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (state->socket_fd < 0) {
+        return -1;
+    }
+
+    serv_addr.sin_family = AF_INET;
+    serv_addr.sin_port = htons(state->server_port);
+    if (inet_pton(AF_INET, state->server_adress, &serv_addr.sin_addr) <= 0) {
+        return -1;
+    }
+
+    if (connect(state->socket_fd, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) < 0) {
+        close(state->socket_fd);
+        state->socket_fd = -1;
+        return -1;
+    }
+
+    return 0;
+}
+
+static void tx_timer_callback(VirtualCANControllerState *state) {
+    qemu_mutex_lock(&state->lock);
+    // set as soon as possible next timer to avoid time drifts
+    timer_mod(state->tx_timer, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 1); 
+
+    switch (state->tx_queue_length) {
+        case 0:
+            // Nothing to transmit
+            break;
+        default:
+            // Check if we are at the end of the current frame 
+            if (state->tx_in_progress && state->tx_bit_cursor == (state->tx_queue[0]).length) {
+                // Pop-out transmitted frame and reset bit cursor for the next
+                // frame
+                state->tx_bit_cursor = 0; 
+                uint8_t frames_to_shift = state->tx_queue_length -1;
+                if (frames_to_shift > 0) {
+                    memmove(&state->tx_queue[0],
+                            &state->tx_queue[1],
+                            sizeof(CANFrame) * frames_to_shift);
+                }
+                state->tx_queue_length--;
+                if (state->tx_queue_length == 0) {
+                    state->tx_in_progress = false;
+                    goto unlock;
+                }
+            }
+            // Transmit the next bit in of the current CAN frame in the queue
+            state->tx_in_progress = true;
+            uint8_t bit_to_send = (state->tx_queue[0]).bits[state->tx_bit_cursor];
+            if (send(state->socket_fd, &bit_to_send, 1, MSG_NOSIGNAL) < 0) {
+                error_report("virtual-can-controller emulation error: failed to send CAN bit");
+            }
+            state->tx_bit_cursor++;
+            state->transmitted_bit = bit_to_send;             
+    }
+
+    unlock:
+    qemu_mutex_unlock(&state->lock);
+}
+
+static void handle_rx(VirtualCANControllerState *state) {
+    // TODO
 }
