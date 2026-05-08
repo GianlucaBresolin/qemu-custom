@@ -48,11 +48,18 @@ typedef struct VirtualCANControllerState {
     uint8_t rx_error_count;
     RoughCANFrame pending_rough_can_frame;
 
+    // TX
     CANFrame tx_queue[10];
     uint8_t tx_queue_length;
     bool tx_in_progress;
     uint8_t tx_bit_cursor;
     uint8_t transmitted_bit;
+
+    // RX
+    CANFrame rx_queue[10];
+    uint8_t rx_queue_length;
+    bool rx_in_progress;
+    uint8_t consecutive_bit_count; // TODO: need to be initialized
 
     // TCP CONNECTION
     int socket_fd;
@@ -350,6 +357,37 @@ static void apply_bit_stuffing(CANFrame *frame) {
     frame->length = current_stuffed_bits;
 }
 
+static int8_t apply_bit_unstaffing(uint8_t rx_bit, VirtualCANControllerState* state) {
+    /* 
+        returns:
+        -1 -> error in bit unstaffing
+         0 -> correct bit unstaffing
+         1 -> correct bit unstaffing: rx stuffed bit (to be removed from CANFrame)
+    */
+    if (state->rx_in_progress) {
+        CANFrame rx_frame = state->rx_queue[state->rx_queue_length];
+        // SoF
+        if (rx_frame.length == 0) {
+            state->consecutive_bit_count++;
+            return 0;
+        }
+        // check if it is a stuffed bit and if it is right
+        if (state->consecutive_bit_count == 5) {
+            if (rx_frame.bits[rx_frame.length -1] != rx_bit) {
+                return 1;
+            } else {
+                apply_rx_error(state);
+                return -1;
+            }
+        } 
+
+        if (rx_frame.bits[rx_frame.length] == rx_bit) {
+            state->consecutive_bit_count++;
+        }
+    }
+    return 0;
+}
+
 static void append_can_frame_to_tx_queue(VirtualCANControllerState *state, CANFrame *frame) 
 {
     if (state->tx_queue_length >= 10) {
@@ -357,7 +395,6 @@ static void append_can_frame_to_tx_queue(VirtualCANControllerState *state, CANFr
         return;
     }
     state->tx_queue[state->tx_queue_length] = *frame;
-    memcpy(state->tx_queue, frame->bits, frame->length);
     state->tx_queue_length++;
 }
 
@@ -439,6 +476,8 @@ static uint8_t connect_to_virtual_can_bus(VirtualCANControllerState *state)
         return -1;
     }
 
+    qemu_set_fd_handler(state->socket_fd, (IOHandler *)rx_callback, NULL, state);
+
     return 0;
 }
 
@@ -483,6 +522,28 @@ static void tx_timer_callback(VirtualCANControllerState *state) {
     qemu_mutex_unlock(&state->lock);
 }
 
-static void handle_rx(VirtualCANControllerState *state) {
-    // TODO
+static void rx_callback(VirtualCANControllerState *state) {
+    uint8_t bit_received;
+    
+    qemu_mutex_lock(&state->lock);
+
+    ssize_t ret = recv(state->socket_fd, &bit_received, 1, 0);
+    if (ret <= 0) {
+        qemu_set_fd_handler(state->socket_fd, NULL, NULL, NULL);
+        cllose(state->socket_fd);
+        state->socket_fd = -1;
+        goto unlock;
+    }
+
+    check_transmission(bit_received, state);
+    if (apply_bit_unstaffing(bit_received, state) == 0) {
+        append_rx_bit_to_can_frame(bit_received, state);
+    }
+
+    unlock:
+    qemu_mutex_unlock(state->lock);
+
+    // here checks if a transmission is going and check sended bit with received
+    // based on index, check if we are in contention and eventually reset
+    // trnamission for the packet
 }
