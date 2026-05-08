@@ -292,6 +292,7 @@ static void build_can_frame(VirtualCANControllerState *state) {
     // Control 
     frame.bits[13] = 0; // IDE (ignored)
     frame.bits[14] = 0; // r0 (ignored)
+    // DLC
     for (int i = 0; i < 4; i++) {
         frame.bits[15 +i] = (state->pending_rough_can_frame.dlc >> (3 - i)) & 1;
     }
@@ -398,6 +399,23 @@ static void append_can_frame_to_tx_queue(VirtualCANControllerState *state, CANFr
     state->tx_queue_length++;
 }
 
+static void check_transmission(uint8_t bit_received, VirtualCANControllerState* state) 
+{
+    if (state->tx_in_progress) {
+        if (bit_received == state->transmitted_bit) {
+            return;
+        } else {
+            if (state->tx_bit_cursor < 1 || state->tx_bit_cursor > 11) {
+                // not arbitration mode: apply tx error
+                apply_tx_error(state);
+            }
+            // reset can frame transmission
+            state->tx_in_progress = false;
+            state->tx_bit_cursor = 0;
+        }
+    }
+}
+
 static void apply_tx_error(VirtualCANControllerState *state) 
 {
     if (state->can_bus_state == BUS_OFF) {
@@ -486,36 +504,32 @@ static void tx_timer_callback(VirtualCANControllerState *state) {
     // set as soon as possible next timer to avoid time drifts
     timer_mod(state->tx_timer, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 1); 
 
-    switch (state->tx_queue_length) {
-        case 0:
-            // Nothing to transmit
-            break;
-        default:
-            // Check if we are at the end of the current frame 
-            if (state->tx_in_progress && state->tx_bit_cursor == (state->tx_queue[0]).length) {
-                // Pop-out transmitted frame and reset bit cursor for the next
-                // frame
-                state->tx_bit_cursor = 0; 
-                uint8_t frames_to_shift = state->tx_queue_length -1;
-                if (frames_to_shift > 0) {
-                    memmove(&state->tx_queue[0],
-                            &state->tx_queue[1],
-                            sizeof(CANFrame) * frames_to_shift);
-                }
-                state->tx_queue_length--;
-                if (state->tx_queue_length == 0) {
-                    state->tx_in_progress = false;
-                    goto unlock;
-                }
+    if (state->tx_queue_length > 0) {
+        // Check if we are at the end of the current frame 
+        if (state->tx_in_progress && state->tx_bit_cursor == (state->tx_queue[0]).length -1) {
+            // Pop-out transmitted frame and reset bit cursor for the next
+            // frame
+            state->tx_bit_cursor = 0; 
+            uint8_t frames_to_shift = state->tx_queue_length -1;
+            if (frames_to_shift > 0) {
+                memmove(&state->tx_queue[0],
+                        &state->tx_queue[1],
+                        sizeof(CANFrame) * frames_to_shift);
             }
-            // Transmit the next bit in of the current CAN frame in the queue
-            state->tx_in_progress = true;
-            uint8_t bit_to_send = (state->tx_queue[0]).bits[state->tx_bit_cursor];
-            if (send(state->socket_fd, &bit_to_send, 1, MSG_NOSIGNAL) < 0) {
-                error_report("virtual-can-controller emulation error: failed to send CAN bit");
+            state->tx_queue_length--;
+            if (state->tx_queue_length == 0) {
+                state->tx_in_progress = false;
+                goto unlock;
             }
-            state->tx_bit_cursor++;
-            state->transmitted_bit = bit_to_send;             
+        }
+        // Transmit the next bit in of the current CAN frame in the queue
+        state->tx_in_progress = true;
+        uint8_t bit_to_send = (state->tx_queue[0]).bits[state->tx_bit_cursor];
+        if (send(state->socket_fd, &bit_to_send, 1, MSG_NOSIGNAL) < 0) {
+            error_report("virtual-can-controller emulation error: failed to send CAN bit");
+        }
+        state->tx_bit_cursor++;
+        state->transmitted_bit = bit_to_send;             
     }
 
     unlock:
@@ -530,7 +544,7 @@ static void rx_callback(VirtualCANControllerState *state) {
     ssize_t ret = recv(state->socket_fd, &bit_received, 1, 0);
     if (ret <= 0) {
         qemu_set_fd_handler(state->socket_fd, NULL, NULL, NULL);
-        cllose(state->socket_fd);
+        close(state->socket_fd);
         state->socket_fd = -1;
         goto unlock;
     }
@@ -542,8 +556,4 @@ static void rx_callback(VirtualCANControllerState *state) {
 
     unlock:
     qemu_mutex_unlock(state->lock);
-
-    // here checks if a transmission is going and check sended bit with received
-    // based on index, check if we are in contention and eventually reset
-    // trnamission for the packet
 }
