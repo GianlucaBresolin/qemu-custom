@@ -59,7 +59,9 @@ typedef struct VirtualCANControllerState {
     CANFrame rx_queue[10];
     uint8_t rx_queue_length;
     bool rx_in_progress;
-    uint8_t consecutive_bit_count; // TODO: need to be initialized
+    uint8_t consecutive_bit_count; 
+    uint8_t rx_bit_cursor;
+    qemu_irq rx_irq; 
 
     // TCP CONNECTION
     int socket_fd;
@@ -69,6 +71,9 @@ typedef struct VirtualCANControllerState {
 
 static uint64_t virtual_can_controller_read(void *opaque, hwaddr offset, unsigned size)
 {
+    // remember to set irq back to 0
+
+
     VirtualCANControllerState *state = VIRTUAL_CAN_CONTROLLER(opaque);
 
     uint8_t req[6] = { 'R' }; // 'R' + addr(4B) + size(1B)
@@ -206,13 +211,19 @@ static void virtual_can_controller_realize(DeviceState *dev, Error **errp)
     state->tx_error_count = 0;
     state->rx_error_count = 0;
     state->tx_queue_length = 0;
+    state->rx_queue_length = 0;
+    state->tx_bit_cursor = 0;
+    state->rx_bit_cursor = 0;
+    state->consecutive_bit_count = 0;
+    state->tx_in_progress = false;
+    state->rx_in_progress = false;
 
     // Connect to our virtual CAN bus
     connect_to_virtual_can_bus(state);
 
     // Init TX Timer
     state->tx_timer = timer_new_ms(QEMU_CLOCK_VIRTUAL, (QEMUTimerCB *)tx_timer_callback, state);
-    timer_mod(state->tx_timer, qemu_clock_get_ms(QEMU_CLOCK_VITUAL) + 1);
+    timer_mod(state->tx_timer, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 1);
 }
 
 static void virtual_can_controller_instance_init(Object *obj)
@@ -224,6 +235,8 @@ static void virtual_can_controller_instance_init(Object *obj)
         dev, 
         &state->mmio
     );
+
+    sysbus_init_irq(dev, &state->rx_ir);
 }
 
 static void virtual_can_controller_class_init(ObjectClass *klass, const void *data)
@@ -401,7 +414,7 @@ static void append_can_frame_to_tx_queue(VirtualCANControllerState *state, CANFr
 
 static void check_transmission(uint8_t bit_received, VirtualCANControllerState* state) 
 {
-    if (state->tx_in_progress) {
+    if (state->tx_in_progress && state->rx_in_progress) {
         if (bit_received == state->transmitted_bit) {
             return;
         } else {
@@ -412,6 +425,34 @@ static void check_transmission(uint8_t bit_received, VirtualCANControllerState* 
             // reset can frame transmission
             state->tx_in_progress = false;
             state->tx_bit_cursor = 0;
+        }
+    }
+}
+
+static void append_rx_bit_to_can_frame(uint8_t bit_received, VirtualCANController* state)
+{
+    if (state->rx_in_progress) {
+        state->rx_queue[state->rx_queue_length].bits[state->rx_bit_cursor] = bit_received;
+        if (state->rx_bit_cursor++ == MAX_CAN_BITS) {
+            // received a complete CAN frame
+            state->rx_queue_length++;
+            state->rx_bit_cursor = 0;
+            state->rx_in_progress = false;
+            if (state->tx_in_progress) {
+                apply_successfull_tx(state);
+                state->tx_in_progress = false;
+                // remove transmitted frame from tx queue
+                state->tx_bit_cursor = 0;
+                uint8_t frames_to_shift = state->tx_queue_length -1;
+                if (frames_to_shift > 0) {
+                    memmove(&state->tx_queue[0],
+                            &state->tx_queue[1],
+                            sizeof(CANFrame) * frames_to_shift);
+                }
+                state->tx_queue_length--;
+            }
+            // rise interrupt to notify the ECU
+            qemu_set_irq(state->rx_irq, 1);
         }
     }
 }
@@ -472,6 +513,7 @@ static void update_can_bus_state(VirtualCANControllerState *state)
 
 ///////////////////////////////////////////////////////////////////////////////
 // CAN BUS INTERACTION
+// tx and rx callbacks & tcp connection init with virtual can bus
 ///////////////////////////////////////////////////////////////////////////////
 static uint8_t connect_to_virtual_can_bus(VirtualCANControllerState *state) 
 {   
@@ -507,20 +549,7 @@ static void tx_timer_callback(VirtualCANControllerState *state) {
     if (state->tx_queue_length > 0) {
         // Check if we are at the end of the current frame 
         if (state->tx_in_progress && state->tx_bit_cursor == (state->tx_queue[0]).length -1) {
-            // Pop-out transmitted frame and reset bit cursor for the next
-            // frame
-            state->tx_bit_cursor = 0; 
-            uint8_t frames_to_shift = state->tx_queue_length -1;
-            if (frames_to_shift > 0) {
-                memmove(&state->tx_queue[0],
-                        &state->tx_queue[1],
-                        sizeof(CANFrame) * frames_to_shift);
-            }
-            state->tx_queue_length--;
-            if (state->tx_queue_length == 0) {
-                state->tx_in_progress = false;
-                goto unlock;
-            }
+            goto unlock;
         }
         // Transmit the next bit in of the current CAN frame in the queue
         state->tx_in_progress = true;
@@ -547,6 +576,11 @@ static void rx_callback(VirtualCANControllerState *state) {
         close(state->socket_fd);
         state->socket_fd = -1;
         goto unlock;
+    }
+
+    // check if a rx is in progress
+    if (state->rx_in_progress == false && bit_received == 0) {
+        state->rx_in_progress = true;
     }
 
     check_transmission(bit_received, state);
