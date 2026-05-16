@@ -71,10 +71,9 @@ typedef struct VirtualCANControllerState {
 
 static uint64_t virtual_can_controller_read(void *opaque, hwaddr offset, unsigned size)
 {
-    // remember to set irq back to 0
-
-
     VirtualCANControllerState *state = VIRTUAL_CAN_CONTROLLER(opaque);
+
+    qemu_irq_lower(state->rx_irq);
 
     uint8_t req[6] = { 'R' }; // 'R' + addr(4B) + size(1B)
     uint64_t value = 0;
@@ -224,6 +223,9 @@ static void virtual_can_controller_realize(DeviceState *dev, Error **errp)
     // Init TX Timer
     state->tx_timer = timer_new_ms(QEMU_CLOCK_VIRTUAL, (QEMUTimerCB *)tx_timer_callback, state);
     timer_mod(state->tx_timer, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 1);
+
+    // Init RX IRQ
+    sysbus_init_irq(SYS_BUS_DEVICE(dev), &state->rx_irq);
 }
 
 static void virtual_can_controller_instance_init(Object *obj)
@@ -452,7 +454,7 @@ static void append_rx_bit_to_can_frame(uint8_t bit_received, VirtualCANControlle
                 state->tx_queue_length--;
             }
             // rise interrupt to notify the ECU
-            qemu_set_irq(state->rx_irq, 1);
+            qemu_irq_raise(state->rx_irq);
         }
     }
 }
@@ -551,7 +553,7 @@ static void tx_timer_callback(VirtualCANControllerState *state) {
         if (state->tx_in_progress && state->tx_bit_cursor == (state->tx_queue[0]).length -1) {
             goto unlock;
         }
-        // Transmit the next bit in of the current CAN frame in the queue
+        // Transmit the next bit of the current CAN frame in the queue
         state->tx_in_progress = true;
         uint8_t bit_to_send = (state->tx_queue[0]).bits[state->tx_bit_cursor];
         if (send(state->socket_fd, &bit_to_send, 1, MSG_NOSIGNAL) < 0) {
