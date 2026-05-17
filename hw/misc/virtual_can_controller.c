@@ -399,15 +399,6 @@ static int8_t apply_bit_unstaffing(uint8_t rx_bit, VirtualCANControllerState* st
     return 0;
 }
 
-static void apply_IFS(VirtualCANControllerState *state) {
-    // only who transmitted a frame transmit IFS, others just observe them
-    // before transmitting the next frame
-    state->IFS_counter = 3;
-    if (state->can_bus_state == ERROR_PASSIVE) {
-        state->IFS_counter += 8
-    }
-}
-
 static void append_can_frame_to_tx_queue(VirtualCANControllerState *state, CANFrame *frame) 
 {
     if (state->tx_queue_length >= 10) {
@@ -454,9 +445,10 @@ static void append_rx_bit_to_can_frame(uint8_t bit_received, VirtualCANControlle
             state->rx_queue_length++;
             state->rx_bit_cursor = 0;
             state->rx_in_progress = false;
+            state->IFS_counter = 3;
             apply_successfull_rx(state);
             if (state->tx_in_progress) {
-                apply_IFS(state);
+                state->IFS_counter += 8;
                 apply_successfull_tx(state);
                 state->tx_in_progress = false;
                 // remove transmitted frame from tx queue
@@ -571,6 +563,16 @@ static void tx_timer_callback(VirtualCANControllerState *state) {
     qemu_mutex_lock(&state->lock);
     // set as soon as possible next timer to avoid time drifts
     timer_mod(state->tx_timer, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 1); 
+
+    // Check if we can transmit:
+    // - we are not in BUS_OFF state
+    // - no rx is in progress
+    if (
+        state->can_bus_state == BUS_OFF ||
+        state->rx_in_progress
+    ) {
+        goto unlock;
+    }
 
     // Check if we are still in the IFS of the previous tx
     if (state->IFS_counter > 0) {
