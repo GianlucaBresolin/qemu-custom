@@ -334,12 +334,6 @@ static void build_can_frame(VirtualCANControllerState *state) {
         frame.bits[frame.length +i] = 1;
     }
     frame.length += 7;
-    // IFS 
-    // TODO: inssert it when we transmit the frame, not here
-    for (int i = 0; i < 3; i++) {
-        frame.bits[frame.length + i] = 1;
-    }
-    frame.length += 3;
     append_can_frame_to_tx_queue(state, &frame);
 }
 
@@ -405,6 +399,15 @@ static int8_t apply_bit_unstaffing(uint8_t rx_bit, VirtualCANControllerState* st
     return 0;
 }
 
+static void apply_IFS(VirtualCANControllerState *state) {
+    // only who transmitted a frame transmit IFS, others just observe them
+    // before transmitting the next frame
+    state->IFS_counter = 3;
+    if (state->can_bus_state == ERROR_PASSIVE) {
+        state->IFS_counter += 8
+    }
+}
+
 static void append_can_frame_to_tx_queue(VirtualCANControllerState *state, CANFrame *frame) 
 {
     if (state->tx_queue_length >= 10) {
@@ -453,6 +456,7 @@ static void append_rx_bit_to_can_frame(uint8_t bit_received, VirtualCANControlle
             state->rx_in_progress = false;
             apply_successfull_rx(state);
             if (state->tx_in_progress) {
+                apply_IFS(state);
                 apply_successfull_tx(state);
                 state->tx_in_progress = false;
                 // remove transmitted frame from tx queue
@@ -568,6 +572,16 @@ static void tx_timer_callback(VirtualCANControllerState *state) {
     // set as soon as possible next timer to avoid time drifts
     timer_mod(state->tx_timer, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 1); 
 
+    // Check if we are still in the IFS of the previous tx
+    if (state->IFS_counter > 0) {
+        if (send(state->socket_fd, &(uint8_t){1}, 1, MSG_NOSIGNAL) < 0) {
+            error_report("virtual-can-controller emulation error: failed to send IFS bit");
+        }
+        state->IFS_counter--;
+        goto unlock;
+    }
+
+    // Check if we have a CAN frame to transmit
     if (state->tx_queue_length > 0) {
         // Check if we are at the end of the current frame 
         if (state->tx_in_progress && state->tx_bit_cursor == (state->tx_queue[0]).length -1) {
