@@ -11,7 +11,8 @@
 #define TYPE_VIRTUAL_CAN_CONTROLLER "virtual-can-controller"
 OBJECT_DECLARE_SIMPLE_TYPE(VirtualCANControllerState, VIRTUAL_CAN_CONTROLLER)
 
-#define MAX_CAN_BITS 135 
+#define MAX_CAN_BITS 135;
+
 typedef enum {
     ERROR_ACTIVE, 
     ERROR_PASSIVE,
@@ -431,15 +432,26 @@ static void check_transmission(uint8_t bit_received, VirtualCANControllerState* 
     }
 }
 
+static bool check_end_of_can_frame(VirtualCANControllerState* state) {
+    static const uint8_t eof_pattern[7] = {1, 1, 1, 1, 1, 1, 1};
+    if (state->rx_queue[state->rx_queue_length].length >= 7) {
+        uint8_t *last7 = &state->rx_queue[state->rx_queue_length].bits[state->rx_bit_cursor -7];
+        return memcmp(last7, eof_pattern, 7) == 0;
+    }
+    return false;
+}
+
 static void append_rx_bit_to_can_frame(uint8_t bit_received, VirtualCANController* state)
 {
     if (state->rx_in_progress) {
         state->rx_queue[state->rx_queue_length].bits[state->rx_bit_cursor] = bit_received;
-        if (state->rx_bit_cursor++ == MAX_CAN_BITS) {
+        state->rx_bit_cursor++;
+        if (check_end_of_can_frame(state)) {
             // received a complete CAN frame
             state->rx_queue_length++;
             state->rx_bit_cursor = 0;
             state->rx_in_progress = false;
+            apply_successfull_rx(state);
             if (state->tx_in_progress) {
                 apply_successfull_tx(state);
                 state->tx_in_progress = false;
@@ -490,12 +502,20 @@ static void apply_successfull_tx(VirtualCANControllerState *state)
 
     if (state->tx_error_count > 0) {
         state->tx_error_count--;
+        update_can_bus_state(state);
     }
-    if (state->rx_error_count > 0) {
-        state->rx_error_count--;
+}
+
+static void apply_successfull_rx(VirtualCANControllerState *state) {
+    if (state->can_bus_state == BUS_OFF) {
+        // once in BUS_OFF, do not allow state changes
+        return;
     }
 
-    update_can_bus_state(state);
+    if (state->rx_error_count > 0) {
+        state->rx_error_count--;
+        update_can_bus_state(state);
+    }
 }
 
 static void update_can_bus_state(VirtualCANControllerState *state) 
