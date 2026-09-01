@@ -1396,8 +1396,11 @@ static void stellaris_init(MachineState *ms, stellaris_board_info *board)
     create_unimplemented_device("hibernation", 0x400fc000, 0x1000);
     create_unimplemented_device("flash-control", 0x400fd000, 0x1000);
 
-    DeviceState *can_dev = qdev_find_recursive(sysbus_get_default(), "virtual-can-controller");
-    sysbus_connect_irq(SYS_BUS_DEVICE(can_dev), 0, qdev_get_gpio_in(nvic, 40));
+    sysbus_create_varargs("virtual-can-controller", -1,
+                        qdev_get_gpio_in(nvic, 40),  // rx
+                        qdev_get_gpio_in(nvic, 41),  // tx error
+                        NULL);
+
 
     armv7m_load_kernel(ARMV7M(armv7m)->cpu, ms->kernel_filename, 0, flash_size);
 }
